@@ -45,10 +45,40 @@ def launch_path(generation):
 
 
 def seal_launch_scopes(authority):
+    roots = authority.resource_roots
+    if (not roots and not authority.workspace and not authority.inherited
+            and any(isinstance(b, NativeBackendResource) and b.tool_id in LAUNCH_TOOLS
+                    for b in authority.backend_resources)):
+        # Chats without a selected project still execute in the dedicated
+        # agent workspace. Seal it now, rather than choosing a root at launch.
+        try:
+            roots = (default_launch_root(authority.owner),)
+        except (OSError, ValueError, RuntimeError):
+            roots = ()  # An unavailable default workspace grants no launch.
     return tuple(seal_launch_scope(backend, root)
                  for backend in authority.backend_resources
                  if isinstance(backend, NativeBackendResource) and backend.tool_id in LAUNCH_TOOLS
-                 for root in authority.resource_roots)
+                 for root in roots)
+
+
+def default_launch_root(owner):
+    from src.constants import AGENT_WORKSPACE_DIR
+    from src.agent_runtime.resources import FilesystemRoot
+    return FilesystemRoot.seal(AGENT_WORKSPACE_DIR, owner=owner)
+
+
+def resolve_proposed_process_operation(authority, operation, backend):
+    """Seal a top-level exact proposal without widening request authority."""
+    if (operation.tool in LAUNCH_TOOLS and not authority.inherited
+            and backend not in authority.backend_resources
+            and not any(s.backend == backend for s in authority.launch_scopes)):
+        from dataclasses import replace
+        roots = authority.resource_roots
+        if not roots and not authority.workspace:
+            roots = (default_launch_root(authority.owner),)
+        authority = replace(authority, launch_scopes=tuple(
+            seal_launch_scope(backend, root) for root in roots))
+    return resolve_process_operation(authority, operation, backend)
 
 
 def seal_launch_scope(backend, root, *, env=None):

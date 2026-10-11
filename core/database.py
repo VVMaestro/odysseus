@@ -1333,6 +1333,42 @@ def _migrate_add_model_tool_modes_column():
             pass
 
 
+def _migrate_chatgpt_subscription_native_tools():
+    """One-time removal of the Subscription adapter's legacy tools=False default.
+
+    Old False values have no provenance: provisioning used to overwrite even
+    explicit choices. After this migration, False is a user override and must
+    survive both startup and reconnect. Other providers are never updated.
+    """
+    from src.chatgpt_subscription import is_chatgpt_subscription_base
+
+    migration = "chatgpt_subscription_native_tools_v1"
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (name VARCHAR PRIMARY KEY)"
+            ))
+            if conn.execute(text(
+                "SELECT name FROM schema_migrations WHERE name = :name"
+            ), {"name": migration}).first():
+                return
+            rows = conn.execute(text(
+                "SELECT ep.id, ep.base_url FROM model_endpoints ep "
+                "JOIN provider_auth_sessions auth ON auth.id = ep.provider_auth_id "
+                "WHERE auth.provider = :provider"
+            ), {"provider": "chatgpt-subscription"}).fetchall()
+            for endpoint_id, base_url in rows:
+                if is_chatgpt_subscription_base(base_url):
+                    conn.execute(text(
+                        "UPDATE model_endpoints SET supports_tools = :enabled WHERE id = :id"
+                    ), {"enabled": True, "id": endpoint_id})
+            conn.execute(text(
+                "INSERT INTO schema_migrations (name) VALUES (:name)"
+            ), {"name": migration})
+    except Exception as exc:
+        logger.warning("ChatGPT Subscription native-tools migration failed: %s", exc)
+
+
 def _migrate_add_cached_models_column():
     """Add cached_models column to model_endpoints if it doesn't exist."""
     import sqlite3
@@ -2396,6 +2432,7 @@ def init_db():
     _migrate_add_model_endpoint_owner_column()
     _migrate_add_provider_auth_id_column()
     _migrate_add_supports_tools_column()
+    _migrate_chatgpt_subscription_native_tools()
     _migrate_add_model_tool_modes_column()
     _migrate_add_task_run_model_column()
     _migrate_add_owner_column()

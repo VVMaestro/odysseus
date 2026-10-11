@@ -10,6 +10,10 @@ services:
     # :latest and bare :X.Y.Z tags move on every main push.
     image: ${ODYSSEUS_IMAGE:-ghcr.io/odysseus-dev/odysseus:latest}
     build: .
+    # Keep the Moby syscall filter, with namespace operations needed by
+    # unprivileged bubblewrap for native Bash/Python containment.
+    security_opt:
+      - seccomp=./docker/seccomp-bubblewrap.json
     ports:
       - "${APP_BIND:-127.0.0.1}:${APP_PORT:-7011}:7000"
     volumes:

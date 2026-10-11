@@ -2,7 +2,7 @@
 
 Covers:
 1. Endpoint/account grouping in modelPicker.js (keyed on endpoint_id, distinct routes, collapsible headers, search auto-expansion, keyboard nav).
-2. ChatGPT reasoning effort (validation, catalog metadata, session thinking_mode persistence, payload shaping with zero provider tools).
+2. ChatGPT reasoning effort (validation, catalog metadata, session thinking_mode persistence, local functions without hosted tools).
 3. Composer UI elements and styles.
 """
 
@@ -193,8 +193,8 @@ def test_history_and_chat_routes_support_reasoning_effort():
     assert "session.thinking_mode = \"off\"" in sess_src
 
 
-def test_responses_payload_zero_tools_with_reasoning():
-    """Verify that reasoning effort does NOT permit any native tool surfaces."""
+def test_responses_payload_local_functions_with_reasoning():
+    """Reasoning supports local functions while hosted tool surfaces stay blocked."""
     forbidden_tools = [
         {"type": "function", "function": {"name": "test"}},
         {"type": "web_search_preview"},
@@ -209,7 +209,7 @@ def test_responses_payload_zero_tools_with_reasoning():
         tools=forbidden_tools,
     )
     assert payload["reasoning"] == {"effort": "high"}
-    assert "tools" not in payload
+    assert payload["tools"] == [{"type": "function", "strict": False, "name": "test"}]
     assert "tool_choice" not in payload
     for k in llm_core.CHATGPT_FORBIDDEN_PAYLOAD_KEYS:
         assert k not in payload

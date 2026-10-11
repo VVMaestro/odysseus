@@ -6158,6 +6158,19 @@ def requested_capabilities(message: str, history: Iterable = (), *, active_docum
     clauses = re.split(r"[;\n]|[.!?]\s+|\b(?:and|then)\s+(?=" + _ACTION_REQUEST + r")",
                        text, flags=re.I)
     families = set().union(*(_clause_capabilities(clause) for clause in clauses))
+    # Native request authority uses this classifier independently of tool RAG.
+    # Russian workspace instructions must admit the same family as English
+    # instructions; merely offering file schemas cannot grant execution rights.
+    if (re.search(
+            r"\b(?:рабоч\w*\s+(?:каталог\w*|папк\w*|директор\w*)|"
+            r"файл\w*|репозитори\w*|исходн\w*\s+код\w*)\b", text, re.I)
+            and any(not re.search(r"\bне\s+$", text[:match.start()], re.I)
+                    for match in re.finditer(
+                        r"\b(?:проанализируй(?:те)?|изучи(?:те)?|прочитай(?:те)?|"
+                        r"посмотри(?:те)?|проверь(?:те)?|исправь(?:те)?|"
+                        r"доработай(?:те)?|отредактируй(?:те)?|создай(?:те)?|"
+                        r"сохрани(?:те)?)\b", text, re.I))):
+        families.add("shell_files")
     if re.search(r"(?:file://)?/tmp_workspace(?:/|\b)", text, re.I):
         families.add("shell_files")
     if (

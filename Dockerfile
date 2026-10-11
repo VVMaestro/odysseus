@@ -108,6 +108,11 @@ COPY --from=realesrgan-wheels /wheels/ /tmp/odysseus-wheels/
 RUN pip install --no-cache-dir --no-deps /tmp/odysseus-wheels/*.whl \
     && rm -rf /tmp/odysseus-wheels
 
+# Native Bash/Python execution requires a filesystem and process-tree boundary.
+# A process group alone cannot satisfy enforcing containment.
+RUN apt-get update && apt-get install -y --no-install-recommends bubblewrap \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy app code
 COPY . .
 # Require the redistribution notices in the image build context.

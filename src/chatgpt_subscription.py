@@ -804,13 +804,107 @@ def build_responses_input(messages: list[dict]) -> list[dict]:
     input_items: list[dict] = []
     for msg in messages or []:
         role = msg.get("role") or "user"
-        if role == "tool":
-            role = "user"
         content = msg.get("content")
         if isinstance(content, list):
             text = "\n".join(str(part.get("text") or part.get("content") or "") for part in content if isinstance(part, dict))
         else:
             text = "" if content is None else str(content)
-        input_type = "output_text" if role == "assistant" else "input_text"
-        input_items.append({"role": role, "content": [{"type": input_type, "text": text}]})
+        if role == "tool" and msg.get("tool_call_id"):
+            input_items.append({
+                "type": "function_call_output",
+                "call_id": msg["tool_call_id"],
+                "output": text,
+            })
+            continue
+        if role == "tool":
+            # Legacy text-mode history has no native call to link this output
+            # to. Keep it as user input instead of breaking existing chats.
+            role = "user"
+        tool_calls = msg.get("tool_calls") if role == "assistant" else None
+        if text or not tool_calls:
+            input_type = "output_text" if role == "assistant" else "input_text"
+            input_items.append({"role": role, "content": [{"type": input_type, "text": text}]})
+        for call in tool_calls or []:
+            function = call["function"]
+            arguments = function.get("arguments", "{}")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments)
+            input_items.append({
+                "type": "function_call",
+                "call_id": call["id"],
+                "name": function["name"],
+                "arguments": arguments,
+            })
     return input_items
+
+
+class ResponsesToolCallAccumulator:
+    """Join Responses argument deltas and final snapshots without duplicating calls."""
+
+    def __init__(self):
+        self._calls: list[dict] = []
+        self._by_item: dict[str, dict] = {}
+        self._by_index: dict[int, dict] = {}
+        self._by_call: dict[str, dict] = {}
+
+    def _slot(self, data: dict, item: dict) -> dict:
+        item_id = item.get("id") or data.get("item_id")
+        index = data.get("output_index")
+        call_id = item.get("call_id") or data.get("call_id")
+        call = (
+            self._by_item.get(item_id)
+            or self._by_call.get(call_id)
+            or self._by_index.get(index)
+        )
+        if call is None:
+            call = {"id": "", "name": "", "arguments": "", "done": False}
+            self._calls.append(call)
+        if item_id:
+            self._by_item[item_id] = call
+        if index is not None:
+            self._by_index[index] = call
+            call["index"] = index
+        if call_id:
+            call["id"] = call_id
+            self._by_call[call_id] = call
+        name = item.get("name") or data.get("name")
+        if name:
+            call["name"] = name
+        return call
+
+    def consume(self, event: str, data: dict):
+        if event == "response.completed":
+            for index, item in enumerate((data.get("response") or {}).get("output") or []):
+                self.consume("response.output_item.done", {"output_index": index, "item": item})
+        elif event in ("response.output_item.added", "response.output_item.done"):
+            item = data.get("item") or {}
+            if item.get("type") != "function_call":
+                return
+            call = self._slot(data, item)
+            if "arguments" in item and (event.endswith(".done") or not call["arguments"]):
+                call["arguments"] = item["arguments"] or ""
+            if event.endswith(".done"):
+                call["done"] = True
+        elif event in ("response.function_call_arguments.delta", "response.function_call_arguments.done"):
+            call = self._slot(data, {})
+            if event.endswith(".delta"):
+                if not call["done"]:
+                    call["arguments"] += data.get("delta") or ""
+            else:
+                if "arguments" in data:
+                    call["arguments"] = data["arguments"] or ""
+                call["done"] = True
+
+    def calls(self, *, terminal: bool = False) -> list[dict]:
+        calls = []
+        seen = set()
+        for call in sorted(self._calls, key=lambda item: item.get("index", len(self._calls))):
+            # Never substitute the output item's id for the protocol's call_id.
+            if not call["id"] or not call["name"] or (not terminal and not call["done"]):
+                raise ValueError("ChatGPT Subscription returned an incomplete function call")
+            if not isinstance(json.loads(call["arguments"]), dict):
+                raise ValueError("ChatGPT Subscription function arguments must be a JSON object")
+            if call["id"] not in seen:
+                calls.append({key: call[key] for key in ("id", "name", "arguments")})
+                seen.add(call["id"])
+        return calls

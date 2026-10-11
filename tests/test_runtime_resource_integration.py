@@ -115,6 +115,116 @@ async def test_exact_launch_first_use_replay_and_empty_scope_restoration(workspa
     assert sibling["failure_kind"] == "request_authority_denied"
 
 
+@pytest.mark.parametrize("tool,content", [("bash", "printf approved"), ("python", "print('approved')")])
+@pytest.mark.parametrize("selected_workspace", [True, False])
+@pytest.mark.parametrize("granted", [True, False])
+async def test_chat_launch_approval_seals_workspace_before_click(
+        workspace, monkeypatch, tool, content, selected_workspace, granted):
+    from src import constants
+    monkeypatch.setattr(constants, "AGENT_WORKSPACE_DIR", str(workspace))
+    original = RequestAuthority("request", "alice", "thread",
+        str(workspace) if selected_workspace else "",
+        (OperationGrant(tool if granted else "ask_user"),))
+    snapshot = original.to_dict()
+    approval = approval_for(original, tool, content)
+    bound = approval.pending.process_operation
+    assert bound is not None and bound.launch.scope.root.path == str(workspace.resolve())
+    assert original.to_dict() == snapshot
+    if not selected_workspace:
+        assert original.resource_roots == ()
+
+    calls = []
+    async def implementation(block, **kwargs):
+        calls.append(block.content)
+        assert resources.active_process_operation().launch == bound.launch
+        resources.require_launch(tool, cwd=str(workspace), content=block.content)
+        return tool, {"exit_code": 0, "output": "approved"}
+    monkeypatch.setattr(tool_execution, "_execute_tool_block_impl", implementation)
+    _, changed = await dispatch(original, tool, content + " changed", approval)
+    assert changed["exit_code"] == 1 and calls == []
+    with bind_request_authority(original):
+        _, result = await dispatch(original, tool, content, approval)
+    assert result["exit_code"] == 0 and calls == [content]
+    _, replay = await dispatch(original, tool, content, approval)
+    assert replay["exit_code"] == 1 and calls == [content]
+
+
+@pytest.mark.parametrize("tool,content", [("bash", "printf approved"), ("python", "print('approved')")])
+@pytest.mark.parametrize("extra_denials", [set(), {"web_search", "web_fetch"}])
+async def test_exact_chat_approval_reaches_real_process_producer(workspace, tool, content, extra_denials):
+    original = authority(workspace, "ask_user")
+    approval = approval_for(original, tool, content)
+    with bind_request_authority(original):
+        _, result = await tool_execution.execute_tool_block(ToolBlock(tool, content),
+            owner=original.owner, session_id=original.session_id, workspace=original.workspace,
+            security_context=ToolRunSecurityContext(external_untrusted_context_seen=True),
+            exact_approval=approval, disabled_tools=extra_denials)
+    assert result["exit_code"] == 0, result
+    assert result["output"].strip() == "approved"
+
+
+def test_same_request_rebinding_preserves_delegation_boundary(workspace):
+    original = authority(workspace, "ask_user")
+    with bind_request_authority(original):
+        with bind_request_authority(replace(original)) as rebound:
+            assert rebound is original and not rebound.inherited
+        with bind_request_authority(replace(original, request_id="child")) as child:
+            assert child.inherited
+            with bind_request_authority(child.restrict(disabled_tools={"web_search"})) as rebound_child:
+                assert rebound_child.inherited
+        restricted = original.restrict(disabled_tools={"web_search"})
+        with bind_request_authority(restricted) as rebound:
+            assert not rebound.inherited and "web_search" in rebound.denied
+            with bind_request_authority(original) as relaxed:
+                assert relaxed.inherited and "web_search" in relaxed.denied
+        with bind_request_authority(replace(original, grants=(OperationGrant("bash"),))) as changed:
+            assert changed.inherited and not changed.permits(ExactOperation.normalize("bash", "pwd"))
+
+
+async def test_exact_approval_cannot_override_new_tool_denial(workspace, monkeypatch):
+    original = authority(workspace, "ask_user")
+    approval = approval_for(original, "bash", "printf approved")
+    monkeypatch.setattr(tool_execution, "_execute_tool_block_impl",
+        lambda *a, **k: pytest.fail("disabled producer dispatched"))
+    with bind_request_authority(original):
+        _, result = await tool_execution.execute_tool_block(ToolBlock("bash", "printf approved"),
+            owner=original.owner, session_id=original.session_id, workspace=original.workspace,
+            security_context=ToolRunSecurityContext(external_untrusted_context_seen=True),
+            exact_approval=approval, disabled_tools={"bash"})
+    assert result["failure_kind"] == "request_authority_denied" and not approval._claimed
+
+
+async def test_exact_proposed_launch_does_not_refresh_replaced_workspace(workspace, monkeypatch):
+    original = authority(workspace, "ask_user")
+    approval = approval_for(original, "bash", "pwd")
+    assert approval.pending.process_operation is not None
+    workspace.rename(workspace.with_name("old-workspace"))
+    workspace.mkdir()
+    monkeypatch.setattr(tool_execution, "_execute_tool_block_impl",
+        lambda *a, **k: pytest.fail("replacement workspace dispatched"))
+    _, result = await dispatch(original, "bash", "pwd", approval)
+    assert result["failure_kind"] == "resource_identity_denied" and not approval._claimed
+
+
+def test_child_approval_cannot_add_proposed_launch_scope(workspace):
+    original = replace(authority(workspace, "ask_user"), inherited=True)
+    approval = approval_for(original, "bash", "pwd")
+    assert approval.pending.process_operation is None
+
+
+@pytest.mark.parametrize("selected_workspace", [True, False])
+def test_missing_launch_workspace_cannot_be_reconstructed_at_click(workspace, monkeypatch, selected_workspace):
+    from src import constants
+    missing = workspace / "missing"
+    monkeypatch.setattr(constants, "AGENT_WORKSPACE_DIR", str(missing))
+    original = RequestAuthority("request", "alice", "thread",
+        str(missing) if selected_workspace else "", (OperationGrant("bash"),))
+    approval = approval_for(original, "bash", "pwd")
+    assert approval.pending.process_operation is None
+    missing.mkdir()
+    assert original.launch_scopes == () and approval.pending.process_operation is None
+
+
 async def test_exact_job_first_use_replay_and_empty_scope_restoration(workspace, monkeypatch):
     bg_jobs._JOBS_DIR.mkdir(parents=True)
     record = {"id": "job", "session_id": "thread", "command": "printf history", "pid": 4321,

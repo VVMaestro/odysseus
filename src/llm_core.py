@@ -1504,9 +1504,9 @@ def _chatgpt_subscription_instructions(messages: List[Dict]) -> str:
 # Provider-native agentic surfaces that must never be sent on the ChatGPT
 # Subscription route. ChatGPT provides model inference only; Odysseus is the
 # only agent (planning, tool selection/execution, filesystem, shell, browser,
-# MCP). Odysseus' own text tool protocol travels inside ``instructions``/``input``.
+# MCP). Function schemas describe Odysseus tools; provider-hosted tools remain
+# forbidden. Text tool mode travels inside ``instructions``/``input``.
 CHATGPT_FORBIDDEN_PAYLOAD_KEYS = frozenset({
-    "tools",
     "tool_choice",
     "parallel_tool_calls",
     "web_search",
@@ -1539,15 +1539,10 @@ def _build_chatgpt_responses_payload(
     reasoning_effort: Optional[str] = None,
     **_ignored,
 ) -> Dict:
-    """Build the ChatGPT/Codex Responses request: model inference only.
-
-    ``tools`` (and any other provider-native tool declaration) is accepted for
-    signature compatibility with the other transports and deliberately
-    discarded. See :data:`CHATGPT_FORBIDDEN_PAYLOAD_KEYS`.
-    """
+    """Build inference input with optional locally executed function tools."""
     from src.chatgpt_subscription import build_responses_input
 
-    del tools, _ignored
+    del _ignored
     conversation = [msg for msg in (messages or []) if (msg.get("role") or "") != "system"]
     payload: Dict = {
         "model": model,
@@ -1558,6 +1553,15 @@ def _build_chatgpt_responses_payload(
     }
     if not _restricts_temperature(model):
         payload["temperature"] = temperature
+    if tools:
+        functions = [
+            # Keep Chat's optional-argument semantics. Hosted browser, shell,
+            # MCP and other provider-side tool declarations are never forwarded.
+            {"type": "function", "strict": False, **tool["function"]}
+            for tool in tools if tool.get("type") == "function"
+        ]
+        if functions:
+            payload["tools"] = functions
     # ChatGPT Subscription Codex API does not support max_output_tokens —
     # passing it returns HTTP 400 "Unsupported parameter: max_output_tokens".
     # Do not include it in the payload.
@@ -1567,13 +1571,20 @@ def _build_chatgpt_responses_payload(
 
 
 CHATGPT_ALLOWED_PAYLOAD_KEYS = frozenset({
-    "model", "instructions", "input", "stream", "store", "temperature", "reasoning",
+    "model", "instructions", "input", "stream", "store", "temperature", "reasoning", "tools",
 })
 
 
 def _strip_chatgpt_native_tool_surfaces(payload: Dict) -> Dict:
-    """Only explicitly approved inference fields may cross this boundary."""
-    return {key: value for key, value in payload.items() if key in CHATGPT_ALLOWED_PAYLOAD_KEYS}
+    """Allow inference fields and local functions, never provider-hosted tools."""
+    result = {key: value for key, value in payload.items() if key in CHATGPT_ALLOWED_PAYLOAD_KEYS}
+    if "tools" in result:
+        functions = [tool for tool in result["tools"] or [] if tool.get("type") == "function"]
+        if functions:
+            result["tools"] = functions
+        else:
+            result.pop("tools")
+    return result
 
 
 def _chatgpt_safe_error(message: str, headers: Dict) -> str:
@@ -2973,7 +2984,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         h = _provider_headers(provider, headers)
         payload = _build_chatgpt_responses_payload(
             model, messages_copy, temperature, max_tokens, stream=True,
-            reasoning_effort=reasoning_effort,
+            tools=tools, reasoning_effort=reasoning_effort,
         )
     else:
         target_url = _normalize_openai_chat_url(url)
@@ -3038,6 +3049,9 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
 
     # ── ChatGPT Subscription / Codex Responses streaming ──
     if provider == "chatgpt-subscription":
+        from src.chatgpt_subscription import ResponsesToolCallAccumulator
+
+        function_calls = ResponsesToolCallAccumulator()
         event_name = ""
         input_tokens = 0
         output_tokens = 0
@@ -3063,11 +3077,19 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                     raw = line[5:].strip()
                     if not raw:
                         continue
+                    if raw == "[DONE]":
+                        calls = function_calls.calls(terminal=True)
+                        if calls:
+                            yield f'data: {json.dumps({"type": "tool_calls", "calls": calls})}\n\n'
+                        yield "data: [DONE]\n\n"
+                        return
                     try:
                         data = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
                     evt = data.get("type") or event_name
+                    if payload.get("tools"):
+                        function_calls.consume(evt, data)
                     response_data = data.get("response") or {}
                     reported_model = (
                         response_data.get("model")
@@ -3093,6 +3115,9 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                                 return
                             yield f'data: {json.dumps({"delta": delta})}\n\n'
                     elif evt == "response.completed":
+                        calls = function_calls.calls(terminal=True)
+                        if calls:
+                            yield f'data: {json.dumps({"type": "tool_calls", "calls": calls})}\n\n'
                         usage = (data.get("response") or {}).get("usage") or data.get("usage") or {}
                         if isinstance(usage, dict):
                             raw_input = (
@@ -3123,7 +3148,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                                 yield f'data: {json.dumps({"type": "usage", "data": normalized_usage})}\n\n'
                         yield "data: [DONE]\n\n"
                         return
-                    elif evt in ("response.failed", "error"):
+                    elif evt in ("response.failed", "response.incomplete", "error"):
                         err = data.get("error") or (data.get("response") or {}).get("error") or {}
                         if evt == "error" and not err:
                             # Responses API ``error`` events carry code/message
@@ -3137,6 +3162,9 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                         status = _provider_stream_error_status(err, default=400)
                         yield f'event: error\ndata: {json.dumps({"status": status, "text": _chatgpt_safe_error(text, h)})}\n\n'
                         return
+                calls = function_calls.calls(terminal=True)
+                if calls:
+                    yield f'data: {json.dumps({"type": "tool_calls", "calls": calls})}\n\n'
                 yield "data: [DONE]\n\n"
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             _cooled = _mark_host_dead(target_url)

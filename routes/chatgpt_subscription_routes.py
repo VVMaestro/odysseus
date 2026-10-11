@@ -180,6 +180,7 @@ def _provision_endpoint(
                 base_url=base,
                 model_type="llm",
                 endpoint_kind="api",
+                supports_tools=True,
                 owner=owner,
             )
             db.add(ep)
@@ -189,9 +190,10 @@ def _provision_endpoint(
         ep.api_key = None
         ep.provider_auth_id = auth.id
         ep.is_enabled = True
-        # ChatGPT provides inference only. Odysseus is the only agent: no
-        # provider-native tool schemas are ever sent on this route.
-        ep.supports_tools = False
+        # Odysseus executes the model's function calls. Preserve a user's
+        # explicit native/text tool mode when reconnecting this account.
+        if ep.supports_tools is None:
+            ep.supports_tools = True
         ep.model_type = "llm"
         ep.endpoint_kind = "api"
         ep.model_refresh_mode = "manual"

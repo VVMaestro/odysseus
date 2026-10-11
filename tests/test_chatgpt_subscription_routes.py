@@ -75,7 +75,7 @@ def test_provision_creates_owner_scoped_auth_session_and_endpoint(monkeypatch):
         assert ep.provider_auth_id == auth.id
         assert ep.endpoint_kind == "api"
         assert ep.model_refresh_mode == "manual"
-        assert ep.supports_tools is False
+        assert ep.supports_tools is True
         assert json.loads(ep.cached_models) == ["gpt-5.5", "o4-mini"]
     finally:
         db.close()
@@ -115,7 +115,7 @@ def test_second_connection_creates_independent_auth_and_endpoint(monkeypatch):
         assert ep_rows[first["id"]].base_url == ep_rows[second["id"]].base_url
         assert json.loads(ep_rows[first["id"]].cached_models) == json.loads(ep_rows[second["id"]].cached_models)
         for ep in ep_rows.values():
-            assert ep.supports_tools is False
+            assert ep.supports_tools is True
     finally:
         db.close()
 
@@ -539,9 +539,22 @@ def test_endpoint_listing_exposes_account_metadata_without_credentials(monkeypat
     assert by_id[a["id"]]["provider"] == "chatgpt-subscription"
     assert by_id[a["id"]]["provider_auth_id"] == a["provider_auth_id"]
     assert by_id[a["id"]]["account_label"] == "codex00"
-    assert by_id[a["id"]]["supports_tools"] is False
+    assert by_id[a["id"]]["supports_tools"] is True
     assert by_id[a["id"]]["has_key"] is False
     labels = sorted(r["account_label"] for r in rows)
     assert labels == ["codex00", "codex01"]
     dumped = json.dumps(rows)
     assert "AT-" not in dumped and "RT-" not in dumped and "refresh_token" not in dumped
+
+
+@pytest.mark.parametrize("mode", [True, False, None])
+def test_reconnect_preserves_native_tool_choice(monkeypatch, mode):
+    sessions = _mem_db(monkeypatch)
+    result = _connect(monkeypatch, "alice", label="native")
+    with sessions() as db:
+        db.get(ModelEndpoint, result["id"]).supports_tools = mode
+        db.commit()
+    reconnected = _connect(monkeypatch, "alice", reconnect_auth_id=result["provider_auth_id"], reconnect_endpoint_id=result["id"])
+    assert reconnected["id"] == result["id"]
+    with sessions() as db:
+        assert db.get(ModelEndpoint, result["id"]).supports_tools is (mode is not False)

@@ -39,6 +39,7 @@ from src.llm_core import (
     _normalize_usage_counts,
 )
 from src.model_context import estimate_tokens, is_local_endpoint
+from src.chatgpt_subscription import is_chatgpt_subscription_base
 from src.model_profiles import (
     ODYSSEUS_COMPACT_TOOL_SCHEMA_PROFILE,
     is_odysseus_merged_tools_model,
@@ -8466,7 +8467,11 @@ def _agent_route_tool_mode(
     ):
         is_api_model = False
     else:
-        is_api_model = any(host in endpoint_url for host in _API_HOSTS) or model_supports_tools
+        is_api_model = (
+            is_chatgpt_subscription_base(endpoint_url)
+            or any(host in endpoint_url for host in _API_HOSTS)
+            or model_supports_tools
+        )
     return is_api_model, is_ollama_native, ollama_openai_compat
 
 
@@ -8722,18 +8727,42 @@ def _uploaded_file_read_only_turn(
     return False
 
 
+# Bounded stems cover common Russian imperative/infinitive forms and case
+# endings without matching fragments inside unrelated words. Keep these shared
+# between domain detection and the active-workspace toolset guard.
+_RUSSIAN_WORKSPACE_CODE_ACTION = (
+    r"\b(?:исправ|поправ|почин|пофикс|устран|доработ|улучш|добав|удал|убер|убра|"
+    r"измен|поменя|обнов|рефактор|передел|(?:от)?редактир|перепиш|перепис|"
+    r"напиш|напис|пиш|реализ|отлад|протест|тестир|провер|запуст|запуск|"
+    r"собер|собра|собир|скомпил|сохран|созд|переимен|перемест|скопир|"
+    r"откро|откры|прочита|прочти|чита|посмотр|изуч)[а-яё]*\b"
+)
+_RUSSIAN_FILE_TARGET = (
+    r"\b(?:файл|папк|каталог|директори|репозитор|терминал|исходник)[а-яё]*\b"
+)
+_RUSSIAN_WORKSPACE_CODE_TARGET = (
+    _RUSSIAN_FILE_TARGET
+    + r"|\b(?:код(?:а|у|ом|е|ы|ов|ам|ами|ах)?|скрипт[а-яё]*|"
+    r"программ(?:а|ы|е|у|ой|ою|ам|ами|ах)?|"
+    r"игр(?:а|ы|е|у|ой|ою|ам|ами|ах)?|приложени[а-яё]*|проект[а-яё]*|"
+    r"компонент[а-яё]*|модул[а-яё]*|функци[а-яё]*|класс[а-яё]*|"
+    r"баг[а-яё]*|ошиб[а-яё]*|тест[а-яё]*|ветк[а-яё]*|коммит[а-яё]*)\b"
+)
+
 _WORKSPACE_CODE_ACTION_RE = re.compile(
     r"\b(?:fix|debug|implement|add|remove|change|update|refactor|write|create|edit|code|program|wire|hook|"
     r"test|verify|run|build|lint|compile|commit|branch|merge|review|"
-    r"download|save|rename|move|copy|extract|convert|open|inspect|read)\b",
+    r"download|save|rename|move|copy|extract|convert|open|inspect|read)\b"
+    + "|" + _RUSSIAN_WORKSPACE_CODE_ACTION,
     re.IGNORECASE,
 )
 _WORKSPACE_CODE_TARGET_RE = re.compile(
     r"\b(?:repo|project|codebase|app|frontend|backend|ui|css|js|javascript|"
-    r"typescript|python|route|api|component|module|function|class|file|tests?|"
+    r"typescript|python|route|api|component|module|function|class|file|tests?|game|code|script|program|"
     r"parser|parsing|bug|error|traceback|regression|failing|failure|branch|commit|folder|"
     r"directory|path|movie|video|subtitle|subtitles|srt|vtt|ass|ffmpeg)\b"
-    r"|(?:~?/[^\"'\s`<>]+)",
+    r"|(?:~?/[^\"'\s`<>]+)"
+    + "|" + _RUSSIAN_WORKSPACE_CODE_TARGET,
     re.IGNORECASE,
 )
 _WORKSPACE_FILE_TARGET_RE = re.compile(
@@ -10905,6 +10934,8 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         domains.add("documents")
     if "notes_calendar_tasks" not in domains and has(r"\bwrite\b"):
         domains.add("documents")
+    if has(_RUSSIAN_FILE_TARGET):
+        domains.add("files")
     _workspace_coding_request = _looks_like_workspace_coding_request(retrieval_query)
     if _workspace_coding_request:
         domains.add("files")
@@ -22418,8 +22449,8 @@ async def stream_agent_loop(
             logger.info("[tool-rag] Low-signal but workspace active; including read-only file tools")
         else:
             # Don't short-circuit: fall through to RAG retrieval below.
-            # Non-English queries are flagged low_signal by the English-only
-            # intent classifier, but fastembed retrieval works across languages.
+            # Queries without a recognized domain can be flagged low_signal,
+            # but fastembed retrieval works across languages.
             logger.info("[tool-rag] Low-signal query; will run RAG retrieval")
     if not guide_only and not _relevant_tools:
         try:
@@ -24501,6 +24532,7 @@ async def stream_agent_loop(
             "mcp_schemas": route_mcp_schemas,
             "relevant_tools": prompt_route_tools,
             "is_api_model": is_api,
+            "is_chatgpt_subscription": is_chatgpt_subscription_base(candidate_url),
             "is_ollama_native": is_native_ollama,
             "ollama_openai_compat": is_ollama_compat,
             "tool_surface": tool_surface,
@@ -25161,6 +25193,9 @@ async def stream_agent_loop(
                 )
             return _filter_route_tool_schemas(schemas)
 
+        if route_state["is_chatgpt_subscription"]:
+            # An explicit native-tools opt-out includes MCP function schemas.
+            return []
         wants_mcp = any(keyword in _last_user.lower() for keyword in _MCP_KEYWORDS)
         schemas = route_mcp_schemas if wants_mcp and route_mcp_schemas else []
         if _pure_web_turn:
@@ -25979,6 +26014,7 @@ async def stream_agent_loop(
             "mcp_schemas": mcp_schemas,
             "relevant_tools": _relevant_tools,
             "is_api_model": _is_api_model,
+            "is_chatgpt_subscription": is_chatgpt_subscription_base(endpoint_url),
             "is_ollama_native": _is_ollama_native,
             "ollama_openai_compat": _ollama_openai_compat,
             "tool_surface": _route_state.get("tool_surface", ""),
@@ -27370,6 +27406,17 @@ async def stream_agent_loop(
                             _is_api_model = answering_state["is_api_model"]
                             _is_ollama_native = answering_state["is_ollama_native"]
                             _ollama_openai_compat = answering_state["ollama_openai_compat"]
+                            # Authorize against the function schemas actually
+                            # offered to the answering route, including when
+                            # the primary used the text tool transport.
+                            answering_tools = answering_state.get("tools")
+                            if answering_tools is None:
+                                answering_tools = _tool_schemas_for_route(answering_state)
+                            _tool_names_sent = [
+                                schema.get("function", {}).get("name")
+                                for schema in answering_tools or []
+                                if schema.get("function")
+                            ]
                             _ody_qwen_finetune_model = answering_state["ody_qwen_finetune_model"]
                             _qwen38_tool_router = answering_state["qwen38_tool_router"]
                             _ody_doc_finetune_mode = answering_state["ody_doc_finetune_mode"]

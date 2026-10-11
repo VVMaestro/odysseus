@@ -219,6 +219,15 @@ class RequestAuthority:
             block_all=self.block_all or policy.block_all_tool_calls,
             disable_mcp=self.disable_mcp or policy.disable_mcp)
 
+    def is_policy_restriction_of(self, parent):
+        """Same request and resource observations, with only stricter policy."""
+        return (isinstance(parent, RequestAuthority)
+                and self.denied >= parent.denied
+                and (not parent.block_all or self.block_all)
+                and (not parent.disable_mcp or self.disable_mcp)
+                and replace(self, denied=parent.denied, block_all=parent.block_all,
+                            disable_mcp=parent.disable_mcp) == parent)
+
     def intersect(self, child):
         if not isinstance(child, RequestAuthority):
             raise TypeError("Child authority must be server-owned RequestAuthority")
@@ -440,7 +449,14 @@ def bind_request_authority(authority):
     if not isinstance(authority, RequestAuthority):
         raise TypeError("Authority must be server-owned RequestAuthority")
     parent = _ACTIVE.get()
-    authority = parent.intersect(authority) if parent is not None else authority
+    # Rebinding or applying stricter policy to the current request is not
+    # delegation. Request/grant/resource changes still intersect, and an
+    # already inherited request never becomes a top-level request here.
+    if parent is not None:
+        if authority == parent:
+            authority = parent
+        elif not authority.is_policy_restriction_of(parent):
+            authority = parent.intersect(authority)
     token = _ACTIVE.set(authority)
     try:
         yield authority

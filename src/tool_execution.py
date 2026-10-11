@@ -1661,7 +1661,8 @@ async def execute_tool_block(
 
     authority = active_request_authority() if request_authority is MISSING_AUTHORITY else request_authority
     parent = active_request_authority()
-    if isinstance(authority, RequestAuthority) and parent is not None and authority is not parent:
+    if (isinstance(authority, RequestAuthority) and parent is not None
+            and not authority.is_policy_restriction_of(parent)):
         authority = parent.intersect(authority)
     try:
         operation = ExactOperation.normalize(getattr(block, "tool_type", None), getattr(block, "content", None))

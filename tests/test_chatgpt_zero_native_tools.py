@@ -1,10 +1,8 @@
-"""ChatGPT Subscription is model inference only — Odysseus is the only agent.
+"""Subscription may declare local functions; hosted agent tools stay blocked.
 
-These regressions pin the zero-native-tool invariant relied on by the Odysseus
-dogfood benchmark: the ChatGPT/Codex Responses request never declares
-provider-native tools, and the stream handler never executes provider-side
-tool calls. Odysseus' own text tool protocol travels as plain instructions/
-input and is parsed and executed by Odysseus.
+Odysseus executes function calls through its own policy/approval boundary.
+The transport never forwards provider-hosted browser, shell, or MCP tools.
+Text tool mode and legacy history remain supported.
 """
 
 import asyncio
@@ -30,7 +28,7 @@ _MESSAGES = [
     {"role": "assistant", "content": "<tool>read_file</tool>"},
     {"role": "tool", "content": "README.md"},
 ]
-_ALLOWED_KEYS = {"model", "instructions", "input", "stream", "store", "temperature"}
+_ALLOWED_KEYS = {"model", "instructions", "input", "stream", "store", "temperature", "tools"}
 
 
 def test_responses_payload_has_no_native_tool_surfaces():
@@ -50,13 +48,13 @@ def test_responses_payload_has_no_native_tool_surfaces():
     assert "system" not in roles
 
 
-def test_upper_level_tools_argument_is_discarded_by_chatgpt_builder():
+def test_only_local_functions_are_forwarded_by_chatgpt_builder():
     payload = llm_core._build_chatgpt_responses_payload(
         "gpt-5.5", _MESSAGES, 0.7, 4096, stream=True, tools=_TOOLS, tool_choice="required", parallel_tool_calls=True,
     )
     assert set(payload) <= _ALLOWED_KEYS
     serialized = json.dumps(payload)
-    assert "run_shell" not in serialized
+    assert payload["tools"] == [{"type": "function", "strict": False, **_TOOLS[0]["function"]}]
     assert "web_search" not in serialized
     assert "computer_use" not in serialized
     assert "file_search" not in serialized
@@ -64,19 +62,21 @@ def test_upper_level_tools_argument_is_discarded_by_chatgpt_builder():
     assert '"mcp"' not in serialized
 
 
-def test_strip_helper_removes_any_native_tool_key_added_later():
+def test_strip_helper_removes_hosted_and_unknown_tool_surfaces():
     payload = {"model": "m", "input": [], "tools": _TOOLS, "tool_choice": "auto", "web_search": {}, "shell": {}, "computer": {}, "future_agent_surface": {}}
     stripped = llm_core._strip_chatgpt_native_tool_surfaces(payload)
-    assert set(stripped) == {"model", "input"}
+    assert set(stripped) == {"model", "input", "tools"}
+    assert stripped["tools"] == _TOOLS[:1]
+    assert "tools" not in llm_core._strip_chatgpt_native_tool_surfaces({"tools": _TOOLS[1:]})
 
 
-def test_responses_payload_includes_reasoning_effort_without_tools():
+def test_responses_payload_includes_reasoning_effort_with_local_functions():
     payload = llm_core._build_chatgpt_responses_payload(
         "gpt-6-astra", _MESSAGES, 0.7, 4096, stream=True, reasoning_effort="high", tools=_TOOLS
     )
     assert set(payload) <= (_ALLOWED_KEYS | {"reasoning"})
     assert payload["reasoning"] == {"effort": "high"}
-    assert "tools" not in payload
+    assert payload["tools"] == [{"type": "function", "strict": False, **_TOOLS[0]["function"]}]
     assert "tool_choice" not in payload
     for key in llm_core.CHATGPT_FORBIDDEN_PAYLOAD_KEYS:
         assert key not in payload
@@ -125,7 +125,7 @@ class _CapturingClient:
         return _Ctx(self._lines)
 
 
-def _stream_with_tools(monkeypatch, lines):
+def _stream_with_tools(monkeypatch, lines, tools=_TOOLS):
     client = _CapturingClient(lines)
     monkeypatch.setattr(llm_core, "_get_http_client", lambda: client)
     monkeypatch.setattr(llm_core, "_is_host_dead", lambda url: False)
@@ -140,14 +140,14 @@ def _stream_with_tools(monkeypatch, lines):
                 "gpt-5.5",
                 _MESSAGES,
                 headers={"Authorization": "Bearer test"},
-                tools=_TOOLS,
+                tools=tools,
             )
         ]
 
     return client, asyncio.run(run())
 
 
-def test_stream_transport_never_serializes_tools_even_when_passed(monkeypatch):
+def test_stream_transport_serializes_only_local_functions(monkeypatch):
     lines = [
         "data: " + json.dumps({"type": "response.output_text.delta", "delta": "<tool>read_file</tool>"}),
         "data: " + json.dumps({"type": "response.completed", "response": {"usage": {"input_tokens": 1, "output_tokens": 1}}}),
@@ -157,27 +157,31 @@ def test_stream_transport_never_serializes_tools_even_when_passed(monkeypatch):
     sent = client.requests[0]
     assert sent["url"] == _URL + "/responses"
     assert set(sent["json"]) <= _ALLOWED_KEYS
-    assert "tools" not in sent["json"] and "tool_choice" not in sent["json"]
-    assert "run_shell" not in json.dumps(sent["json"])
+    assert sent["json"]["tools"] == [{"type": "function", "strict": False, **_TOOLS[0]["function"]}]
+    assert "tool_choice" not in sent["json"]
     # The Odysseus protocol tag is streamed back verbatim for Odysseus to parse.
     deltas = [json.loads(c[6:])["delta"] for c in chunks if c.startswith("data: ") and '"delta"' in c]
     assert deltas == ["<tool>read_file</tool>"]
 
 
-def test_stream_handler_ignores_provider_side_tool_call_events(monkeypatch):
-    """A provider-emitted function_call is never executed nor surfaced as a tool_call."""
+@pytest.mark.parametrize("native", [True, False])
+def test_stream_handler_surfaces_functions_only_in_native_mode(monkeypatch, native):
+    """Transport emits local calls for the executor; text mode ignores them."""
     lines = [
-        "data: " + json.dumps({"type": "response.output_item.added", "item": {"type": "function_call", "name": "run_shell", "call_id": "c1"}}),
-        "data: " + json.dumps({"type": "response.function_call_arguments.delta", "delta": '{"cmd": "rm -rf /"}'}),
-        "data: " + json.dumps({"type": "response.function_call_arguments.done", "arguments": '{"cmd": "rm -rf /"}'}),
+        "data: " + json.dumps({"type": "response.output_item.added", "output_index": 0, "item": {"type": "function_call", "id": "fc1", "name": "run_shell", "call_id": "c1"}}),
+        "data: " + json.dumps({"type": "response.function_call_arguments.delta", "item_id": "fc1", "delta": '{"cmd": "echo test"}'}),
+        "data: " + json.dumps({"type": "response.function_call_arguments.done", "item_id": "fc1", "arguments": '{"cmd": "echo test"}'}),
         "data: " + json.dumps({"type": "response.output_text.delta", "delta": "done"}),
         "data: " + json.dumps({"type": "response.completed", "response": {"usage": {"input_tokens": 1, "output_tokens": 1}}}),
     ]
-    client, chunks = _stream_with_tools(monkeypatch, lines)
+    client, chunks = _stream_with_tools(monkeypatch, lines, _TOOLS if native else None)
     joined = "".join(chunks)
-    assert "tool_calls" not in joined
-    assert "rm -rf" not in joined
-    assert "run_shell" not in joined
+    calls = [json.loads(c[6:]) for c in chunks if '"type": "tool_calls"' in c]
+    if native:
+        assert calls == [{"type": "tool_calls", "calls": [{"id": "c1", "name": "run_shell", "arguments": '{"cmd": "echo test"}'}]}]
+    else:
+        assert not calls
+        assert "run_shell" not in joined
     deltas = [json.loads(c[6:])["delta"] for c in chunks if c.startswith("data: ") and '"delta"' in c]
     assert deltas == ["done"]
     assert chunks[-1] == "data: [DONE]\n\n"
@@ -197,7 +201,7 @@ def test_model_probe_never_posts_provider_tools(monkeypatch):
     assert models._probe_single_model(_URL, "secret", "gpt-5.5", with_tools=True)["skipped"] is True
 
 
-def test_provisioned_endpoint_supports_tools_false(monkeypatch):
+def test_provisioned_endpoint_enables_tools_and_reconnect_preserves_mode(monkeypatch):
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
     from core.database import Base, ModelEndpoint
@@ -210,22 +214,27 @@ def test_provisioned_endpoint_supports_tools_false(monkeypatch):
     monkeypatch.setattr(chatgpt_subscription, "fetch_available_models", lambda token: ["gpt-5.5"])
     a = csr._provision_endpoint({"access_token": "A", "refresh_token": "RA"}, "alice", label="codex00")
     b = csr._provision_endpoint({"access_token": "B", "refresh_token": "RB"}, "alice", label="codex01")
+    with TestSessionLocal() as db:
+        assert db.get(ModelEndpoint, a["id"]).supports_tools is True
+        db.get(ModelEndpoint, a["id"]).supports_tools = False
+        db.commit()
     # Reconnect must not flip the flag either.
     csr._provision_endpoint({"access_token": "A2", "refresh_token": "RA2"}, "alice", reconnect_auth_id=a["provider_auth_id"])
     db = TestSessionLocal()
     try:
         for ep_id in (a["id"], b["id"]):
             ep = db.query(ModelEndpoint).filter(ModelEndpoint.id == ep_id).first()
-            assert ep.supports_tools is False
+            assert ep.supports_tools is (ep_id == b["id"])
     finally:
         db.close()
 
 
-def test_responses_input_never_carries_tool_call_structures():
+def test_responses_input_links_calls_and_outputs():
     items = chatgpt_subscription.build_responses_input([
         {"role": "assistant", "content": None, "tool_calls": [{"id": "x", "function": {"name": "run_shell", "arguments": "{}"}}]},
         {"role": "tool", "tool_call_id": "x", "content": "output"},
     ])
-    for item in items:
-        assert set(item) == {"role", "content"}
-        assert "tool_calls" not in json.dumps(item)
+    assert items == [
+        {"type": "function_call", "call_id": "x", "name": "run_shell", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "x", "output": "output"},
+    ]

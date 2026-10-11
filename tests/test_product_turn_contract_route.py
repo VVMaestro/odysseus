@@ -130,6 +130,38 @@ async def test_actual_route_constructs_contract_with_real_mcp_apis(
 
 
 @pytest.mark.asyncio
+async def test_russian_workspace_route_keeps_read_tools_admitted(monkeypatch, tmp_path):
+    from routes import chat_routes
+    from src import tool_security
+    from src.agent_runtime.authority import ExactOperation
+    from tests.test_russian_workspace_authority import REQUEST
+
+    endpoint = _chat_stream_endpoint(monkeypatch, "agent", {})
+    monkeypatch.setattr(chat_routes, "coerce_message_and_session",
+                        lambda *args, **kwargs: (REQUEST, "session-1"))
+    monkeypatch.setattr(tool_security, "owner_is_admin_or_single_user", lambda owner: True)
+    observed = []
+
+    async def capture_agent(*args, **kwargs):
+        contract = kwargs["turn_contract"]
+        authority = kwargs["request_authority"]
+        for name in ("bash", "get_workspace", "read_file"):
+            assert name in contract.offered
+            assert not kwargs["tool_policy"].blocks(name)
+            assert authority.permits(ExactOperation.normalize(name, ""))
+        observed.append(contract.capabilities)
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(chat_routes, "stream_agent_loop", capture_agent)
+    request = _RouteRequest("agent")
+    request._form.update({"message": REQUEST, "workspace": str(tmp_path)})
+    response = await endpoint(request)
+    async for _ in response.body_iterator:
+        pass
+    assert observed == [{"shell_files"}]
+
+
+@pytest.mark.asyncio
 async def test_native_product_browser_turn_cannot_bypass_family_contract(
     monkeypatch, registered_mcp_manager,
 ):

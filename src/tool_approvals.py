@@ -415,9 +415,9 @@ class ToolApprovalStore:
             backend_operation = BoundBackendOperation(backend,
                 request_authority.request_id if request_authority is not None else "",
                 _normalized_owner(owner), str(session_id or ""), operation.transport_tool, operation.input)
-            from src.agent_runtime.process_resources import needs_process_binding, resolve_process_operation
+            from src.agent_runtime.process_resources import needs_process_binding, resolve_proposed_process_operation
             if request_authority is not None and needs_process_binding(operation, backend):
-                process_operation = resolve_process_operation(request_authority, operation, backend)
+                process_operation = resolve_proposed_process_operation(request_authority, operation, backend)
             from src.browser_identity import native_browser, resolve_browser_operation
             if native_browser(operation, backend):
                 if request_authority is None:
